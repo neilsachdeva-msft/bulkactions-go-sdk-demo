@@ -1,4 +1,4 @@
-# BulkActions + ScheduledActions Demo (Go)
+# BulkActions (Go)
 
 This project follows the updated demo plan:
 
