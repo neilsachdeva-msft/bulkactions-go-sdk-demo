@@ -76,6 +76,7 @@ func main() {
 			{Name: to.Ptr("Standard_D8as_v5")},
 		},
 		nil,
+		true, // wait for all VMs to be created before listing
 	)
 
 	// 2) GET the list of succeeded VMs from the BA using LIST VMs.
@@ -93,12 +94,14 @@ func main() {
 	}
 
 	// 4) Create 40K vCPUs of Spot priority using VM Attributes.
+	//    Don't wait — we want to showcase deleting in-progress VMs in steps 5/6.
 	baSpot80KOpID := createBulkActions(
 		armcomputebulkactions.CapacityTypeVCPU,
 		40000,
 		armcomputebulkactions.VirtualMachineTypeSpot,
 		nil,
 		vmAttributes(),
+		false, // don't wait — check in-progress VMs after 5 mins
 	)
 
 	// 5) After 5 mins, GET the list of VMs still in progress from the BA using LIST VMs.
@@ -129,6 +132,7 @@ func main() {
 				armcomputebulkactions.VirtualMachineTypeSpot,
 				nil,
 				vmAttributes(),
+				true, // wait for completion
 			)
 		}(i)
 	}
@@ -241,6 +245,7 @@ func createBulkActions(
 	priorityType armcomputebulkactions.VirtualMachineType,
 	vmSizesProfile []*armcomputebulkactions.VMSizeProfile,
 	vmAttrs *armcomputebulkactions.VMAttributes,
+	waitForCompletion bool,
 ) string {
 	operationID := uuid.New().String()
 	log.Printf("Creating BulkActions (operationID=%s)...", operationID)
@@ -317,10 +322,13 @@ func createBulkActions(
 	poller, err := bulkActionsClient.BeginCreateOrUpdate(ctx, resourceGroupName, location, operationID, parameters, nil)
 	logIfError(err)
 
-	_, err = poller.PollUntilDone(ctx, nil)
-	logIfError(err)
-
-	log.Printf("Created BulkActions (operationID=%s)", operationID)
+	if waitForCompletion {
+		_, err = poller.PollUntilDone(ctx, nil)
+		logIfError(err)
+		log.Printf("BulkActions completed (operationID=%s)", operationID)
+	} else {
+		log.Printf("BulkActions started (operationID=%s), not waiting for completion", operationID)
+	}
 	return operationID
 }
 
