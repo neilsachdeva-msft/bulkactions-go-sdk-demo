@@ -48,6 +48,7 @@ var (
     computeClientFactory          *armcompute.ClientFactory
 
     resourceGroupClient    *armresources.ResourceGroupsClient
+    providersClient        *armresources.ProvidersClient
     virtualNetworksClient  *armnetwork.VirtualNetworksClient
     bulkActionsClient      *armcomputebulkactions.BulkActionsClient
     scheduledActionsClient *armcomputeschedule.ScheduledActionsClient
@@ -163,6 +164,7 @@ func setup() {
     resourcesClientFactory, err = armresources.NewClientFactory(subscriptionID, conn, nil)
     logIfError(err)
     resourceGroupClient = resourcesClientFactory.NewResourceGroupsClient()
+    providersClient = resourcesClientFactory.NewProvidersClient()
 
     networkClientFactory, err = armnetwork.NewClientFactory(subscriptionID, conn, nil)
     logIfError(err)
@@ -180,8 +182,29 @@ func setup() {
     logIfError(err)
     virtualMachinesClient = computeClientFactory.NewVirtualMachinesClient()
 
+    registerProviders()
     createResourceGroup()
     createVirtualNetwork()
+}
+
+func registerProviders() {
+    providers := []struct {
+        namespace string
+        label     string
+    }{
+        {"Microsoft.ComputeBulkActions", "BulkActions"},
+        {"Microsoft.ComputeSchedule", ""},
+    }
+    for _, p := range providers {
+        if p.label != "" {
+            log.Printf("Registering %s resource provider...", p.label)
+        }
+        _, err := providersClient.Register(ctx, p.namespace, nil)
+        logIfError(err)
+        if p.label != "" {
+            log.Printf("%s resource provider registered.", p.label)
+        }
+    }
 }
 
 func createResourceGroup() {
@@ -285,7 +308,7 @@ func createBulkActions(
                         AdminPassword: to.Ptr(adminPassword),
                     },
                     NetworkProfile: &armcomputebulkactions.NetworkProfile{
-                        NetworkAPIVersion: to.Ptr(armcomputebulkactions.NetworkAPIVersionV20201101),
+                        NetworkAPIVersion: to.Ptr(armcomputebulkactions.NetworkAPIVersion20201101),
                         NetworkInterfaceConfigurations: []*armcomputebulkactions.VirtualMachineNetworkInterfaceConfiguration{
                             {
                                 Name: to.Ptr("nic"),
@@ -493,8 +516,8 @@ func vmAttributes() *armcomputebulkactions.VMAttributes {
         ArchitectureTypes: []*armcomputebulkactions.ArchitectureType{
             to.Ptr(armcomputebulkactions.ArchitectureTypeX64),
         },
-        CpuManufacturers: []*armcomputebulkactions.CpuManufacturer{
-            to.Ptr(armcomputebulkactions.CpuManufacturerIntel),
+        CPUManufacturers: []*armcomputebulkactions.CPUManufacturer{
+            to.Ptr(armcomputebulkactions.CPUManufacturerIntel),
         },
         ExcludedVMSizes: []*string{
             to.Ptr("Standard_L64s_v3"),
@@ -512,7 +535,6 @@ func safePrefix(name string) string {
     }
 
     // Compute name prefix length limit varies by image; keep it small.
-    cleaned = cleaned
     if len(cleaned) > 10 {
         cleaned = cleaned[:10]
     }
