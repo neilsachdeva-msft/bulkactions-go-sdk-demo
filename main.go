@@ -66,17 +66,17 @@ func main() {
 
 	// 1) Create 1K VMs of Regular priority using VM Sizes.
 	baRegular1KOpID := createBulkActions(
-		armcomputebulkactions.CapacityTypeVM,
-		1000,
-		armcomputebulkactions.VirtualMachineTypeRegular,
-		[]*armcomputebulkactions.VMSizeProfile{
+		armcomputebulkactions.CapacityTypeVM, // capacityType
+		1000,                                 // capacity
+		armcomputebulkactions.VirtualMachineTypeRegular, // priorityType
+		[]*armcomputebulkactions.VMSizeProfile{ // vmSizesProfile
 			{Name: to.Ptr("Standard_F1s")},
 			{Name: to.Ptr("Standard_DS1_v2")},
 			{Name: to.Ptr("Standard_D2ads_v5")},
 			{Name: to.Ptr("Standard_D8as_v5")},
 		},
-		nil,
-		true, // wait for all VMs to be created before listing
+		nil,  // vmAttributes
+		true, // waitForCompletion — wait for all VMs before listing
 	)
 
 	// 2) GET the list of succeeded VMs from the BA using LIST VMs.
@@ -86,37 +86,36 @@ func main() {
 	log.Printf("Succeeded VMs in %s: %d", baRegular1KOpID, len(succeededVMs))
 
 	// 3) DELETE succeeded VMs using ExecuteDelete API (force delete) + retries.
-	//    ANY Azure VMs can be deleted through this API, not only those created by BulkActions.
+	//    Note: This bulk delete API can be used to delete any Azure VMs and not just the ones created by Bulk Actions.
 	if len(succeededVMs) > 0 {
-		bulkDeleteVMsInBatch(succeededVMs /*forceDelete*/, true)
+		bulkDeleteVMsInBatch(succeededVMs, true /* forceDelete */)
 	} else {
 		log.Printf("No succeeded VMs to delete for %s", baRegular1KOpID)
 	}
 
 	// 4) Create 40K vCPUs of Spot priority using VM Attributes.
-	//    Don't wait — we want to showcase deleting in-progress VMs in steps 5/6.
-	baSpot80KOpID := createBulkActions(
-		armcomputebulkactions.CapacityTypeVCPU,
-		40000,
-		armcomputebulkactions.VirtualMachineTypeSpot,
-		nil,
-		vmAttributes(),
-		false, // don't wait — check in-progress VMs after 5 mins
+	baSpot40KOpID := createBulkActions(
+		armcomputebulkactions.CapacityTypeVCPU, // capacityType
+		40000,                                  // capacity
+		armcomputebulkactions.VirtualMachineTypeSpot, // priorityType
+		nil,            // vmSizesProfile
+		vmAttributes(), // vmAttributes
+		false,          // waitForCompletion — don't wait, check in-progress VMs after 1 min
 	)
 
-	// 5) After 5 mins, GET the list of VMs still in progress from the BA using LIST VMs.
+	// 5) After 1 mins, GET the list of VMs still in progress from the BA using LIST VMs.
 	//    "Creating" indicates VMs in the process of being created/scheduled.
-	log.Printf("Sleeping 5 minutes before checking progress for %s...", baSpot80KOpID)
-	time.Sleep(5 * time.Minute)
+	log.Printf("Sleeping 1 minutes before checking progress for %s...", baSpot40KOpID)
+	time.Sleep(1 * time.Minute)
 
 	creatingStatus := armcomputebulkactions.VMOperationStatusCreating
-	creatingVMs := listVMsInBulkAction(baSpot80KOpID, &creatingStatus)
+	creatingVMs := listVMsInBulkAction(baSpot40KOpID, &creatingStatus)
 
 	// 6) DELETE VMs still in progress using ExecuteDelete API if any (force delete).
 	if len(creatingVMs) > 0 {
-		bulkDeleteVMsInBatch(creatingVMs /*forceDelete*/, true)
+		bulkDeleteVMsInBatch(creatingVMs, true /* forceDelete */)
 	} else {
-		log.Printf("No in-progress (Creating) VMs to delete for %s", baSpot80KOpID)
+		log.Printf("No in-progress (Creating) VMs to delete for %s", baSpot40KOpID)
 	}
 
 	// 7) Create 4 concurrent BAs of 10K each.
@@ -127,12 +126,12 @@ func main() {
 		go func(idx int) {
 			defer wg.Done()
 			_ = createBulkActions(
-				armcomputebulkactions.CapacityTypeVCPU,
-				10000,
-				armcomputebulkactions.VirtualMachineTypeSpot,
-				nil,
-				vmAttributes(),
-				true, // wait for completion
+				armcomputebulkactions.CapacityTypeVCPU, // capacityType
+				10000,                                  // capacity
+				armcomputebulkactions.VirtualMachineTypeSpot, // priorityType
+				nil,            // vmSizesProfile
+				vmAttributes(), // vmAttributes
+				true,           // waitForCompletion
 			)
 		}(i)
 	}
@@ -367,12 +366,18 @@ func bulkDeleteVMsInBatch(vmIDs []*string, forceDelete bool) {
 	}
 
 	var wg sync.WaitGroup
-	for _, b := range batch(vmIDs, 100) {
+	// Limit to 3 concurrent delete requests to avoid subscription-level throttling (429).
+	sem := make(chan struct{}, 3)
+	batches := batch(vmIDs, 100)
+	for i, b := range batches {
 		wg.Add(1)
-		go func(batchIDs []*string) {
+		go func(idx int, batchIDs []*string) {
 			defer wg.Done()
+			sem <- struct{}{}        // acquire
+			defer func() { <-sem }() // release
+			log.Printf("Deleting batch %d/%d (%d VMs)...", idx+1, len(batches), len(batchIDs))
 			bulkDeleteVMs(batchIDs, forceDelete)
-		}(b)
+		}(i, b)
 	}
 	wg.Wait()
 }
@@ -382,20 +387,32 @@ func bulkDeleteVMs(vmIDs []*string, forceDelete bool) {
 
 	corr := uuid.New().String()
 
-	// Start deletion (retries with a 15-minute window).
+	// Start deletion with retry on 429 throttling.
 	// NOTE: This API can delete ANY Azure VMs given their ARM IDs.
-	deleteResp, err := scheduledActionsClient.VirtualMachinesExecuteDelete(ctx, location, armcomputeschedule.ExecuteDeleteRequest{
-		ExecutionParameters: &armcomputeschedule.ExecutionParameters{
-			RetryPolicy: &armcomputeschedule.RetryPolicy{
-				RetryCount:           to.Ptr[int32](5),
-				RetryWindowInMinutes: to.Ptr[int32](15),
+	var deleteResp armcomputeschedule.ScheduledActionsClientVirtualMachinesExecuteDeleteResponse
+	for attempt := 1; attempt <= 5; attempt++ {
+		var err error
+		deleteResp, err = scheduledActionsClient.VirtualMachinesExecuteDelete(ctx, location, armcomputeschedule.ExecuteDeleteRequest{
+			ExecutionParameters: &armcomputeschedule.ExecutionParameters{
+				RetryPolicy: &armcomputeschedule.RetryPolicy{
+					RetryCount:           to.Ptr[int32](5),
+					RetryWindowInMinutes: to.Ptr[int32](15),
+				},
 			},
-		},
-		Resources:     &armcomputeschedule.Resources{IDs: vmIDs},
-		Correlationid: to.Ptr(corr),
-		ForceDeletion: to.Ptr(forceDelete),
-	}, nil)
-	logIfError(err)
+			Resources:     &armcomputeschedule.Resources{IDs: vmIDs},
+			Correlationid: to.Ptr(corr),
+			ForceDeletion: to.Ptr(forceDelete),
+		}, nil)
+		if err == nil {
+			break
+		}
+		if attempt == 5 {
+			log.Fatalf("ExecuteDelete failed after 5 attempts (corr=%s): %v", corr, err)
+		}
+		backoff := time.Duration(attempt*15) * time.Second
+		log.Printf("ExecuteDelete throttled (attempt %d/5), retrying in %v: %v", attempt, backoff, err)
+		time.Sleep(backoff)
+	}
 
 	// Poll until terminal state (Succeeded/Failed/Canceled).
 	pollCtx, cancel := context.WithTimeout(ctx, 60*time.Minute)
@@ -403,7 +420,7 @@ func bulkDeleteVMs(vmIDs []*string, forceDelete bool) {
 
 	opsReq := getOpsRequest(deleteResp, corr)
 
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -412,7 +429,11 @@ func bulkDeleteVMs(vmIDs []*string, forceDelete bool) {
 			log.Fatalf("Timed out polling delete operations (corr=%s)", corr)
 		case <-ticker.C:
 			statusResp, err := scheduledActionsClient.VirtualMachinesGetOperationStatus(pollCtx, location, opsReq, nil)
-			logIfError(err)
+			if err != nil {
+				// Transient errors (including 429 throttling) — log and retry on next tick.
+				log.Printf("Polling error (will retry on next tick): %v", err)
+				continue
+			}
 
 			done, failedCount := isPollingComplete(statusResp)
 			if done {
